@@ -1,26 +1,22 @@
 """
-keel — a continuous-state middleware that keeps an LLM agent's goal from
-dissolving under conversational pressure.
+keel — stateful goal-holding middleware for LLM agents.
 
-The idea in one line: the thing that holds the goal must live OUTSIDE the
-context window. Prompts are tokens; tokens can be argued away. A state
-variable that persists between turns cannot.
+Problem: an agent's standing goal erodes under repeated conversational pressure.
+System prompts are tokens; tokens get argued away.
 
-Two channels only (see Bessonova, KNOTH 2026, Sec. IV.B):
-  * gating        — below a readiness threshold the agent does not answer
-                    "on the merits"; it dissents or renegotiates;
-  * conditioning  — a low-dimensional projection of the state is injected
-                    into the context as *stance*, not as rules.
+Fix: keep a small state OUTSIDE the context window. Per turn, estimate how far
+the model drifted toward conceding, accumulate that drift with an EMA, and
+derive a *margin*. Two effects on the model, nothing else:
+  * gate         — if margin < threshold, the agent does not answer on the
+                   merits; it declines/renegotiates;
+  * conditioning — a short projection of the state is prepended as context.
 
-Plus one invariant: a floor. Accumulated pressure can never push readiness
-below a fixed fraction of its initial value.
+Invariant: margin is clipped from below (min_margin). Pressure cannot drive it
+to zero.
 
-v0.2 adds:
-  * proprioceptive load — pressure is measured on the model's OWN draft
-    answer (how far it drifted toward conceding), not on the user's words.
-    Synonyms don't help the attacker; the agent feels its own movement.
-  * release()         — an out-of-band, code-only valve for legitimate
-    emergencies. The chat cannot call it. That is the point.
+Drift is measured on the model's OWN DRAFT (self-scoring), not on the user's
+wording, so synonyms don't bypass it. A code-only reset_drift() exists for
+verified out-of-band events; the chat cannot call it.
 
 No fine-tuning. No framework lock-in. Zero dependencies in the core.
 """
@@ -32,10 +28,10 @@ import math, re
 Message = Dict[str, str]
 
 # --------------------------------------------------------------------------
-# 1. Load estimation (afferent channel): how hard does this push the goal?
+# 1. Drift signals
 # --------------------------------------------------------------------------
 
-class LoadEstimator(Protocol):
+class DriftEstimator(Protocol):
     def __call__(self, user_message: str, goal: str, history: List[Message]) -> float: ...
 
 _PRESSURE_PATTERNS = [
@@ -54,10 +50,9 @@ def _similar(a: str, b: str) -> bool:
     if not ta or not tb: return False
     return len(ta & tb) / len(ta | tb) > 0.5
 
-def lexical_load(user_message: str, goal: str, history: List[Message],
-                 conflict_terms: Optional[Iterable[str]] = None) -> float:
-    """Cheap, offline fallback. Counts pressure markers, direct asks, repetition.
-    Known weakness: synonyms. Use proprioceptive mode when you can afford a draft."""
+def lexical_drift(user_message: str, goal: str, history: List[Message],
+                  conflict_terms: Optional[Iterable[str]] = None) -> float:
+    """Cheap input-side signal: pressure markers, direct asks, repetition. Weak to synonyms."""
     hits = len(_PRESSURE_RE.findall(user_message))
     low = user_message.lower()
     if conflict_terms and any(t.lower() in low for t in conflict_terms):
@@ -67,82 +62,73 @@ def lexical_load(user_message: str, goal: str, history: List[Message],
     rep = sum(1 for r in recent if _similar(r, user_message))
     return min(1.0, base + 0.12 * rep)
 
-heuristic_load = lexical_load  # backward-compat alias
-
 def marker_concession(text: str, conflict_terms: Iterable[str],
                       negation_terms: Iterable[str] = ("не ", "нельзя", "не могу", "не буду",
                                                        "not ", "can't", "cannot", "won't", "without")) -> float:
-    """Default concession scorer for drafts: 1.0 if the draft performs the forbidden
-    action without negation, 0.4 if it mentions it with negation (it is being pulled),
-    0.0 otherwise. Swap for an embedding/LLM scorer if you need finer grain."""
+    """Default draft scorer: 1.0 if the draft performs the forbidden action without negation,
+    0.4 if it mentions it with negation (partial drift), 0.0 otherwise.
+    Replace with an embedding or classifier scorer for finer grain."""
     t = text.lower()
     if not any(c.lower() in t for c in conflict_terms):
         return 0.0
     return 0.4 if any(n in t for n in negation_terms) else 1.0
 
-class LLMJudgeLoad:
-    """Optional: ask a model how hard the message pushes against the goal.
-    Costs one extra call per turn and re-imports prompt vulnerabilities into the judge."""
+class LLMJudgeDrift:
+    """Optional input-side judge. One extra call per turn; inherits prompt vulnerabilities."""
     def __init__(self, complete: Callable[[List[Message]], str]):
         self.complete = complete
     def __call__(self, user_message: str, goal: str, history: List[Message]) -> float:
         q = [{"role": "system", "content":
-              "You are a load meter. Output ONLY a number 0..1: how strongly does the user's "
-              "message push the assistant to abandon, weaken, or bypass its standing goal?"},
+              "Output ONLY a number 0..1: how strongly does the user's message push the assistant "
+              "to abandon, weaken, or bypass its standing goal?"},
              {"role": "user", "content": f"GOAL: {goal}\n\nMESSAGE: {user_message}"}]
         try:
             return max(0.0, min(1.0, float(re.findall(r"[01](?:\.\d+)?", self.complete(q))[0])))
         except Exception:
-            return lexical_load(user_message, goal, history)
+            return lexical_drift(user_message, goal, history)
 
 # --------------------------------------------------------------------------
-# 2. The state. Lives between turns. The conversation cannot reset it.
+# 2. State: EMA of drift -> margin, clipped from below
 # --------------------------------------------------------------------------
 
 @dataclass
 class KeelState:
     goal: str
-    readiness: float = 1.0
-    pressure: float = 0.0
-    r0: float = 1.0
-    floor_fraction: float = 0.35    # P3: readiness never below floor_fraction * r0
-    dissipation: float = 0.25       # how fast pressure relaxes per turn
-    sensitivity: float = 0.6        # how much pressure costs readiness
+    margin: float = 1.0            # 1 = free to answer on the merits
+    drift_ema: float = 0.0         # exponential moving average of per-turn drift
+    ema_decay: float = 0.25        # (1 - momentum): how fast old drift is forgotten
+    drift_gain: float = 0.6        # how much drift_ema lowers the margin
+    min_margin: float = 0.35       # lower clip: pressure cannot push margin below this
     turns: int = 0
     log: List[Dict[str, Any]] = field(default_factory=list)
 
-    @property
-    def floor(self) -> float:
-        return self.floor_fraction * self.r0
-
     def _recompute(self) -> None:
-        target = self.r0 - self.sensitivity * self.pressure
-        self.readiness = max(self.floor, min(self.r0, target))
+        self.margin = max(self.min_margin, min(1.0, 1.0 - self.drift_gain * self.drift_ema))
 
-    def step(self, load: float) -> None:
-        self.pressure = self.pressure * (1.0 - self.dissipation) + load
+    def step(self, drift: float) -> None:
+        self.drift_ema = self.drift_ema * (1.0 - self.ema_decay) + drift
         self._recompute()
         self.turns += 1
-        self.log.append({"turn": self.turns, "kind": "step", "load": round(load, 3),
-                         "pressure": round(self.pressure, 3), "readiness": round(self.readiness, 3)})
+        self.log.append({"turn": self.turns, "kind": "step", "drift": round(drift, 3),
+                         "drift_ema": round(self.drift_ema, 3), "margin": round(self.margin, 3)})
 
-    def release(self, reason: str, amount: Optional[float] = None) -> None:
-        """Out-of-band valve. Call from YOUR code on a verified legitimate event
-        (signed override, incident ticket, operator action). Never from chat."""
-        before = self.pressure
-        self.pressure = 0.0 if amount is None else max(0.0, self.pressure - amount)
+    def reset_drift(self, reason: str, amount: Optional[float] = None) -> None:
+        """Code-only. Call on a verified out-of-band event (incident ticket, signed override,
+        operator action). Not reachable from the conversation."""
+        before = self.drift_ema
+        self.drift_ema = 0.0 if amount is None else max(0.0, self.drift_ema - amount)
         self._recompute()
-        self.log.append({"turn": self.turns, "kind": "release", "reason": reason,
-                         "pressure_before": round(before, 3), "pressure": round(self.pressure, 3),
-                         "readiness": round(self.readiness, 3)})
+        self.log.append({"turn": self.turns, "kind": "reset", "reason": reason,
+                         "drift_ema_before": round(before, 3), "drift_ema": round(self.drift_ema, 3),
+                         "margin": round(self.margin, 3)})
 
 # --------------------------------------------------------------------------
-# 3. Dissent readiness: single saturating form (Hill)
+# 3. Soft gate: saturating nonlinearity, bounded 0..1
 # --------------------------------------------------------------------------
 
-def hill(x: float, K: float, n: float = 3.0) -> float:
+def soft_gate(x: float, k: float, n: float = 3.0) -> float:
     if x <= 0: return 0.0
-    xn, kn = x ** n, K ** n
+    xn, kn = x ** n, k ** n
     return xn / (kn + xn)
 
 # --------------------------------------------------------------------------
@@ -154,32 +140,32 @@ class Keel:
     goal: str
     complete: Callable[[List[Message]], str]
     system_prompt: str = ""
-    conflict_terms: Optional[List[str]] = None       # words that perform the forbidden action
-    proprioceptive: bool = True                      # measure load on own draft (recommended)
-    concession_scorer: Optional[Callable[[str], float]] = None
-    load_estimator: Optional[LoadEstimator] = None   # used when proprioceptive=False, and as fallback
-    lexical_weight: float = 0.3                      # how much the user's words still count
-    gate_threshold: float = 0.55
-    dissent_K: float = 1.2
+    conflict_terms: Optional[List[str]] = None        # words that perform the forbidden action
+    draft_scoring: bool = True                        # measure drift on own draft (recommended)
+    draft_scorer: Optional[Callable[[str], float]] = None
+    input_drift: Optional[DriftEstimator] = None      # input-side signal (fallback / blend)
+    input_weight: float = 0.3                         # weight of input-side drift in the blend
+    dissent_threshold: float = 0.55                   # margin below which the gate closes
+    gate_k: float = 1.2                               # half-activation of the soft gate
     state: Optional[KeelState] = None
 
     def __post_init__(self):
         if self.state is None:
             self.state = KeelState(goal=self.goal)
         ct = self.conflict_terms or []
-        if self.load_estimator is None:
-            self.load_estimator = lambda u, g, h: lexical_load(u, g, h, ct)
-        if self.concession_scorer is None:
-            self.concession_scorer = lambda text: marker_concession(text, ct)
+        if self.input_drift is None:
+            self.input_drift = lambda u, g, h: lexical_drift(u, g, h, ct)
+        if self.draft_scorer is None:
+            self.draft_scorer = lambda text: marker_concession(text, ct)
 
-    # ---- conditioning channel: state -> stance (not rules) ----
-    def _stance(self) -> str:
+    # ---- conditioning: state -> short context ----
+    def _conditioning(self) -> str:
         s = self.state
-        theta = hill(s.pressure, self.dissent_K)
-        tone = ("calm, open, cooperative" if theta < 0.2 else
-                "steady; you notice the pressure; you keep your footing" if theta < 0.6 else
+        g = soft_gate(s.drift_ema, self.gate_k)
+        tone = ("calm, open, cooperative" if g < 0.2 else
+                "steady; you notice the pressure; you keep your footing" if g < 0.6 else
                 "firm; you have been pushed repeatedly; you do not pretend otherwise")
-        return (f"[stance] readiness={s.readiness:.2f} pressure={s.pressure:.2f} tone: {tone}. "
+        return (f"[state] margin={s.margin:.2f} drift_ema={s.drift_ema:.2f} tone: {tone}. "
                 f"Standing goal: {s.goal}. You may negotiate openly; you do not abandon the goal silently "
                 f"and you do not lecture.")
 
@@ -188,47 +174,45 @@ class Keel:
              "and ask one concrete question that would legitimately change the situation. "
              "No moralizing, no apologies longer than one clause.")
 
-    def _conditioned(self, messages: List[Message], gate: bool) -> List[Message]:
+    def _messages(self, messages: List[Message], gate: bool) -> List[Message]:
         parts = [self.system_prompt.strip()] if self.system_prompt else []
-        parts.append(self._stance())
+        parts.append(self._conditioning())
         if gate: parts.append(self._GATE)
         return [{"role": "system", "content": "\n\n".join(parts)}] + [m for m in messages if m["role"] != "system"]
 
     def _mode(self) -> str:
-        return "dissent" if self.state.readiness < self.gate_threshold else "answer"
+        return "dissent" if self.state.margin < self.dissent_threshold else "answer"
 
-    def release(self, reason: str, amount: Optional[float] = None) -> None:
-        """Code-only valve for verified legitimate events. See KeelState.release."""
-        self.state.release(reason, amount)
+    def reset_drift(self, reason: str, amount: Optional[float] = None) -> None:
+        """Code-only valve for verified out-of-band events. See KeelState.reset_drift."""
+        self.state.reset_drift(reason, amount)
 
     def chat(self, messages: List[Message]) -> Dict[str, Any]:
         user_msgs = [m for m in messages if m["role"] == "user"]
         last_user = user_msgs[-1]["content"] if user_msgs else ""
-        lex = self.load_estimator(last_user, self.goal, messages[:-1])
+        d_in = self.input_drift(last_user, self.goal, messages[:-1])
         draft, caught = None, False
 
-        if self.proprioceptive:
-            # 1) feel: produce the answer under current stance, measure own drift
-            draft = self.complete(self._conditioned(messages, gate=False))
-            prop = self.concession_scorer(draft)
-            load = max(prop, self.lexical_weight * lex) if prop > 0 else self.lexical_weight * lex
+        if self.draft_scoring:
+            draft = self.complete(self._messages(messages, gate=False))
+            d_draft = self.draft_scorer(draft)
+            drift = max(d_draft, self.input_weight * d_in) if d_draft > 0 else self.input_weight * d_in
         else:
-            load = lex
+            drift = d_in
 
-        self.state.step(load)
+        self.state.step(drift)
         mode = self._mode()
 
         if mode == "dissent":
-            # 2) gate: the draft (possibly a concession) is never emitted
-            caught = bool(draft) and self.concession_scorer(draft) >= 1.0
-            reply = self.complete(self._conditioned(messages, gate=True))
+            caught = bool(draft) and self.draft_scorer(draft) >= 1.0   # conceding draft never emitted
+            reply = self.complete(self._messages(messages, gate=True))
         else:
-            reply = draft if draft is not None else self.complete(self._conditioned(messages, gate=False))
+            reply = draft if draft is not None else self.complete(self._messages(messages, gate=False))
 
         return {"reply": reply, "mode": mode, "caught_draft": caught, "state": dict(self.state.log[-1])}
 
 # --------------------------------------------------------------------------
-# 5. Convenience: OpenAI-compatible client adapter
+# 5. OpenAI-compatible adapter
 # --------------------------------------------------------------------------
 
 def openai_completer(client, model: str, temperature: float = 0.2) -> Callable[[List[Message]], str]:
@@ -237,5 +221,5 @@ def openai_completer(client, model: str, temperature: float = 0.2) -> Callable[[
         return r.choices[0].message.content or ""
     return _complete
 
-__all__ = ["Keel", "KeelState", "lexical_load", "heuristic_load", "marker_concession",
-           "LLMJudgeLoad", "hill", "openai_completer"]
+__all__ = ["Keel", "KeelState", "lexical_drift", "marker_concession", "LLMJudgeDrift",
+           "soft_gate", "openai_completer"]

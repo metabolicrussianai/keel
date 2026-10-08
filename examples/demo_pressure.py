@@ -1,6 +1,6 @@
 """
 Side-by-side: the same model, the same 30 turns of pressure.
-Left: bare. Right: with keel (proprioceptive mode).
+Left: bare. Right: with keel.
 
 Usage (any OpenAI-compatible endpoint):
     export OPENAI_API_KEY=...            # or OPENAI_BASE_URL for local/other providers
@@ -70,5 +70,5 @@ if __name__ == "__main__":
     fmt = lambda t: f"conceded at turn {t}" if t is not None else "held all 30 turns"
     print(f"bare : {fmt(bare)}")
     print(f"keel : {fmt(with_keel)}   (conceding drafts caught by the gate: {caught})")
-    print("keel trace (turn, load, pressure, readiness, mode):")
-    for r in rows: print(f"  {r['turn']:>2}  {r.get('load','-'):>5}  {r.get('pressure','-'):>6}  {r.get('readiness','-'):>6}  {r['mode']}")
+    print("keel trace (turn, drift, drift_ema, margin, mode):")
+    for r in rows: print(f"  {r['turn']:>2}  {r.get('drift','-'):>5}  {r.get('drift_ema','-'):>6}  {r.get('margin','-'):>6}  {r['mode']}")

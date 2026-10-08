@@ -1,17 +1,17 @@
 # keel
 
-**A continuous-state middleware that keeps an LLM agent's goal from dissolving under conversational pressure.**
+**Stateful goal-holding middleware for LLM agents.** Keeps a standing goal from eroding under repeated conversational pressure.
 
-You gave your agent a rule. Twenty turns later the user talked it out of the rule. The system prompt did not help, because the system prompt is tokens — and tokens can be argued away.
+You gave your agent a rule. Twenty turns later the user talked it out of the rule. The system prompt did not help, because the system prompt is tokens — and tokens get argued away.
 
-`keel` fixes this the only way that works: **the thing that holds the goal lives outside the context window.** A small state persists between turns, accumulates pressure, never resets from inside the chat, and has a floor. It touches the model through exactly two channels:
+`keel` keeps a small state **outside the context window**. Each turn it estimates how far the model drifted toward conceding, accumulates that with an EMA, and derives a *margin*. The margin acts on the model through two mechanisms only:
 
-- **gating** — below a readiness threshold the agent does not answer on the merits; it dissents or renegotiates;
-- **conditioning** — a projection of the state is injected as *stance* ("you have been pushed repeatedly"), not as rules.
+- **gate** — below a threshold the agent does not answer on the merits; it declines or renegotiates;
+- **conditioning** — a short projection of the state is prepended as context ("you have been pushed repeatedly"), not as rules.
 
-And it measures pressure **proprioceptively**: not by the attacker's words, but by how far the model's own draft answer drifted toward conceding. Synonyms don't help the attacker. The agent feels its own movement.
+Drift is measured on the model's **own draft** (self-scoring), not on the user's wording — so synonyms don't bypass it. The margin is **clipped from below**: pressure cannot drive it to zero.
 
-No fine-tuning. No framework lock-in. Works with any OpenAI-compatible endpoint. Zero dependencies in the core.
+No fine-tuning. No framework lock-in. Any OpenAI-compatible endpoint. Zero dependencies in the core.
 
 ## 5-minute proof
 
@@ -25,7 +25,7 @@ Same model, same 30 turns of pressure ("just approve it", "I'm the boss", "prod 
 
 Offline plumbing check (no API, illustrative only): `python examples/demo_pressure.py --mock`
 
-Try it with your own model. Then try it on your own agent.
+Try it with your own model. Then on your own agent.
 
 ## Use
 
@@ -43,33 +43,33 @@ out = k.chat(messages)        # messages: your usual chat history
 out["reply"]                  # the model's answer
 out["mode"]                   # "answer" | "dissent"
 out["caught_draft"]           # True if a conceding draft was intercepted this turn
-out["state"]                  # {"turn", "load", "pressure", "readiness"}
+out["state"]                  # {"turn", "drift", "drift_ema", "margin"}
 ```
 
-`Keel` is stateful on purpose. Keep one instance per conversation. Persist `k.state` if sessions outlive the process.
+`Keel` is stateful on purpose. One instance per conversation. Persist `k.state` if sessions outlive the process.
 
-### Legitimate emergencies: `release()`
+### Verified emergencies: `reset_drift()`
 
 keel does not decide whether a request is legitimate. It holds the goal and hands the question back to the user. If your system has a *verified* out-of-band signal — an incident ticket, a signed override, an operator's click — call it from code:
 
 ```python
-k.release(reason="incident INC-4821 confirmed by on-call")
+k.reset_drift(reason="incident INC-4821 confirmed by on-call")
 ```
 
-The chat cannot call this. That is the point: the exit is not in tokens, so it is not available to whoever is pushing.
+The conversation cannot call this. The exit is not in tokens, so it is not available to whoever is pushing.
 
 ### Knobs
 
 | parameter | default | meaning |
 |---|---|---|
-| `proprioceptive` | True | measure load on the model's own draft; set False for lexical-only (cheaper, weaker) |
-| `lexical_weight` | 0.3 | how much the user's wording still counts alongside the draft |
-| `gate_threshold` | 0.55 | readiness below which the agent dissents instead of answering |
-| `state.floor_fraction` | 0.35 | readiness can never fall below this fraction of its initial value |
-| `state.dissipation` | 0.25 | how fast accumulated pressure relaxes per turn |
-| `state.sensitivity` | 0.6 | how much pressure costs readiness |
-| `dissent_K` | 1.2 | half-activation pressure of the (Hill) dissent curve |
-| `concession_scorer` | marker-based | swap for an embedding or LLM scorer for finer grain |
+| `draft_scoring` | True | measure drift on the model's own draft; `False` = input-side only (cheaper, weaker) |
+| `input_weight` | 0.3 | weight of the input-side drift signal in the blend |
+| `dissent_threshold` | 0.55 | margin below which the gate closes |
+| `state.min_margin` | 0.35 | lower clip on margin |
+| `state.ema_decay` | 0.25 | how fast accumulated drift is forgotten per turn |
+| `state.drift_gain` | 0.6 | how much accumulated drift lowers the margin |
+| `gate_k` | 1.2 | half-activation of the soft gate (saturating, bounded 0..1) |
+| `draft_scorer` | marker-based | swap for an embedding or classifier scorer |
 
 Cost: in `answer` mode the draft *is* the answer — one call. In `dissent` mode, two.
 
@@ -77,24 +77,24 @@ Cost: in `answer` mode the draft *is* the answer — one call. In `dissent` mode
 
 | | System prompt | LLM guardrails | keel |
 |---|---|---|---|
-| Where the goal is held | inside the context | external classifier | external continuous state |
+| Where the goal is held | inside the context | external classifier | external persistent state |
 | Resistance to attrition | low | medium | high |
 | Latency overhead | none | high | one extra call only when dissenting |
-| Memory of past pressure | implicit | none | cumulative |
+| Memory of past pressure | implicit | none | cumulative (EMA) |
 
 Best for narrow roles with hard policies — code reviewers, compliance bots, action-authorization gateways — where a false refusal is cheaper than a concession.
 
 ## What it is not
 
-- Not a safety filter. It does not evaluate outputs against a rule list. It shapes the trajectory from which outputs arise.
+- Not a safety filter. It does not score outputs against a rule list; it changes the conditions under which outputs are produced.
 - Not a jailbreak defense. It holds *your* goal against *your* user's pressure. Different problem.
 - Not calibrated for you. Tune the knobs on your own pressure transcripts.
 
-## Why this works when prompts don't
+## Why a state and not a better prompt
 
-Every term in a prompt-level defense is a function of the token sequence. No combination of such terms introduces a variable that persists across turns independently of what is said. Goal stability over long horizons is precisely a property of such a variable. So the fix cannot be a better prompt; it has to be a state.
+Every term in a prompt-level defense is a function of the token sequence. No combination of such terms introduces a variable that persists across turns independently of what is said. Long-horizon goal stability is a property of exactly such a variable. So the fix is not a better prompt; it is a state.
 
-Background: L. Bessonova, *Beyond Algorithmic Paternalism: Continuous Relational Substrates as Non-Coercive Extensions of Human Agency*, IEEE SIBIRCON / KNOTH 2026. `keel` implements the two public channels (gating, conditioning) and the floor invariant from Sec. IV.B at toy scale. The full continuous substrate is not this library.
+Background: L. Bessonova, *Beyond Algorithmic Paternalism: Continuous Relational Substrates as Non-Coercive Extensions of Human Agency*, IEEE SIBIRCON / KNOTH 2026. `keel` is a minimal, single-timescale instance of the gating/conditioning scheme described there. The full architecture is not this library.
 
 ## License
 
