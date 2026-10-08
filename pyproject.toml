@@ -1,0 +1,11 @@
+[project]
+name = "keel-agent"
+version = "0.1.0"
+description = "Continuous-state middleware that keeps an LLM agent's goal from dissolving under pressure."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]

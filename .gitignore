@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+examples/run_*.csv
+dist/
+*.egg-info/
